@@ -1,0 +1,49 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+**/venv/
+**/.venv/
+
+# Python cache files
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local database and data directories
+*.db
+**/*.db
+**/user_data/
+user_data/
+
+# Frontend dependencies and builds
+node_modules/
+**/node_modules/
+.vite-cache/
+**/.vite-cache/
+dist/
+**/dist/
+
+# Local configuration files
+.env
+**/.env
+
+# Log files
+*.log
+**/*.log
+
+# User uploads and temporary files
+**/uploads/
+text.txt
+**/text.txt
+*.mp4
+*.webm
+
+# Test and tooling artefacts
+.pytest_cache/
+**/.pytest_cache/
+
+# Note: backend/migrations/versions/ is intentionally NOT ignored —
+# migration scripts must be committed and applied in order.
