@@ -1,0 +1,2747 @@
+import os
+import json
+from contextlib import asynccontextmanager
+from typing import List, Optional, Union, Dict
+from datetime import datetime, date, timedelta, timezone
+import threading
+import asyncio
+import secrets
+import time
+import httpx
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, BackgroundTasks, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from backend.config import cors_origins, cors_origin_regex, validate_runtime_config, settings
+from backend.database import get_db, init_db, Account, Target, MessageTemplate, BotLog, Setting, MetaConnection, log_to_db, SessionLocal, MonitoredPost, ProcessedComment, OptOut, User, TgBotConfig, TgChannel, TgMessageTemplate, TgScheduledPost, TgModerationRule, TgPostLog, Workspace, WorkspaceMember, Subscription, Campaign, AutomationRunner, AuditLog, Notification, MediaFile, Contact, FeatureFlag, LoginAttempt, get_system_setting, set_system_setting, get_workspace_settings, set_workspace_setting
+from backend.schemas import (
+    UserRegisterSchema, UserLoginSchema, TokenResponse, UserResponseSchema,
+    AccountSchema, AccountResponse, MonitoredPostCreate, MonitoredPostResponse,
+    TargetCreateSchema, TargetResponse, MessageTemplateSchema, MessageTemplateUpdateSchema, MessageTemplateResponse,
+    AdminUserDetailResponse, AdminSystemStatsResponse,
+    TgBotConfigCreate, TgScheduledPostCreate, TgScheduledPostUpdate, TgModerationRuleCreate,
+    NotificationResponse, MediaFileResponse,
+    ContactCreate, ContactUpdate, ContactResponse,
+    FeatureFlagCreate, FeatureFlagUpdate, FeatureFlagResponse,
+    AnalyticsDashboardResponse, AnalyticsPointSchema, AuditLogResponse,
+    AISophieRequest, AISophieResponse,
+)
+from backend.auth import (
+    verify_password, get_password_hash, create_access_token,
+    get_current_user, get_current_admin, get_current_workspace, require_workspace_role
+)
+from backend.security import encrypt_secret, decrypt_secret, mask_secret, secret_configured, stable_hash
+import re
+import backend.bot as bot_module
+from backend.bot import start_bot_background, stop_bot_background, InstagramBot, create_browser_event_loop
+from backend.official_api import router as official_api_router
+from backend.telegram_service import telegram_service
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_runtime_config()
+    # Initialize DB tables and default settings
+    init_db()
+
+    app.state.start_time = time.time()
+    log_to_db("INFO", "FastAPI server started. DB initialized.")
+
+    # Auto-start Telegram Service
+    try:
+        await telegram_service.start()
+        log_to_db("INFO", "[TG] Telegram service automatically started on startup.")
+    except Exception as e:
+        log_to_db("ERROR", f"[TG] Failed to auto-start Telegram service: {e}")
+
+    # Resume the Instagram worker if an administrator had it running. The stored
+    # status is the operator's decision; a restart must not silently revert it
+    # and leave the database claiming "running" while nothing is.
+    try:
+        db = SessionLocal()
+        try:
+            should_run = get_system_setting(db, "status") == "running"
+        finally:
+            db.close()
+        if should_run and start_bot_background():
+            log_to_db("INFO", "Automation was running before restart — worker resumed.")
+    except Exception as e:
+        log_to_db("ERROR", f"Failed to resume automation worker on startup: {e}")
+
+    yield
+    # Shutdown routine. persist=False so stopping the process is not recorded as
+    # the administrator switching automation off.
+    stop_bot_background(persist=False)
+    if telegram_service.is_running:
+        await telegram_service.stop()
+    log_to_db("INFO", "FastAPI server shutting down. Bot worker stopped (start state preserved).")
+
+app = FastAPI(
+    title="Lyvora Automation API",
+    description="Backend service managing compliant Instagram DM automation",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Enable CORS for frontend Vercel deployment
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins(),
+    allow_origin_regex=cors_origin_regex(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(official_api_router)
+
+@app.get("/")
+def read_root():
+    # Force uvicorn configuration reload (root-level .env updated)
+    return {"status": "online", "message": "Lyvora Automation API is running!"}
+
+
+# --- Settings / Logs / Trigger Schema Declarations ---
+
+class SettingUpdateSchema(BaseModel):
+    daily_limit: int = Field(default=30, ge=1, le=100)
+    min_delay: int = Field(default=45, ge=10)
+    max_delay: int = Field(default=120, ge=15)
+    working_hours_start: str = Field(default="08:00")
+    working_hours_end: str = Field(default="22:00")
+    api_mode: str = Field(default="sandbox")
+    opt_out_keywords: str = Field(default="stop, unsubscribe, optout, stopdm")
+    consent_enforce: bool = Field(default=True)
+
+
+class MetaConnectionCreateSchema(BaseModel):
+    instagram_user_id: str = Field(..., min_length=3, max_length=100, pattern=r"^\d+$")
+    access_token: str = Field(..., min_length=20, max_length=4096)
+
+class OptOutCreateSchema(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100)
+
+class OptOutResponse(BaseModel):
+    id: int
+    username: str
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class LogResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    level: str
+    message: str
+    
+    class Config:
+        from_attributes = True
+
+class ProcessedCommentResponse(BaseModel):
+    id: int
+    username: str
+    post_id: int
+    comment_text: Optional[str] = None
+    status: str
+    processed_at: datetime
+    post_url: Optional[str] = None
+    trigger_keyword: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+PLAN_LIMITS = {
+    "trial": {
+        "instagram_accounts": 1,
+        "telegram_bots": 1,
+        "campaigns": 2,
+        "daily_dms": 15,
+        "team_members": 1,
+        "local_runners": 1,
+    },
+    "starter": {
+        "instagram_accounts": 2,
+        "telegram_bots": 1,
+        "campaigns": 5,
+        "daily_dms": 30,
+        "team_members": 2,
+        "local_runners": 1,
+    },
+    "pro": {
+        "instagram_accounts": 5,
+        "telegram_bots": 3,
+        "campaigns": 20,
+        "daily_dms": 100,
+        "team_members": 5,
+        "local_runners": 3,
+    },
+    "agency": {
+        "instagram_accounts": 20,
+        "telegram_bots": 10,
+        "campaigns": 100,
+        "daily_dms": 500,
+        "team_members": 25,
+        "local_runners": 10,
+    },
+}
+
+LOGIN_WINDOW_SECONDS = 900
+LOGIN_MAX_ATTEMPTS = 8
+
+
+class WorkspaceCreateSchema(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+
+
+class WorkspaceResponse(BaseModel):
+    id: int
+    name: str
+    slug: str
+    plan_slug: str
+    automation_mode: str
+    role: str
+    created_at: datetime
+
+
+class CampaignCreateSchema(BaseModel):
+    name: str = Field(..., min_length=2, max_length=140)
+    channel: str = Field(default="instagram")
+    mode: str = Field(default="comment_trigger")
+    consent_source: str = Field(default="comment_keyword")
+    daily_limit: int = Field(default=30, ge=1, le=500)
+    account_id: Optional[int] = None
+    template_id: Optional[int] = None
+    trigger_keyword: Optional[str] = None
+
+
+class RunnerCreateSchema(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    runner_type: str = Field(default="local")
+
+
+def slugify_workspace(value: str, user_id: int) -> str:
+    clean = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
+    clean = "-".join(part for part in clean.split("-") if part)
+    return f"{clean or 'workspace'}-{user_id}-{secrets.token_hex(2)}"
+
+
+def active_workspace_for_user(db: Session, user: User) -> Workspace:
+    membership = db.query(WorkspaceMember).filter(
+        WorkspaceMember.user_id == user.id
+    ).order_by(WorkspaceMember.id.asc()).first()
+    if not membership:
+        workspace = Workspace(
+            name=f"{user.username}'s Workspace",
+            slug=slugify_workspace(user.username, user.id),
+            owner_user_id=user.id,
+        )
+        db.add(workspace)
+        db.flush()
+        db.add(WorkspaceMember(workspace_id=workspace.id, user_id=user.id, role="owner"))
+        db.add(Subscription(workspace_id=workspace.id, plan_slug=workspace.plan_slug, status="trialing"))
+        db.commit()
+        db.refresh(workspace)
+        return workspace
+    return membership.workspace
+
+
+def workspace_role(db: Session, workspace_id: int, user_id: int) -> str:
+    membership = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == user_id,
+    ).first()
+    return membership.role if membership else "none"
+
+
+def assert_plan_limit(db: Session, workspace: Workspace, metric: str, current_count: int):
+    limits = PLAN_LIMITS.get(workspace.plan_slug, PLAN_LIMITS["starter"])
+    limit = limits.get(metric)
+    if limit is not None and current_count >= limit:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Plan limit reached for {metric}. Upgrade the workspace plan to continue.",
+        )
+
+
+def audit(db: Session, action: str, user: Optional[User] = None, workspace: Optional[Workspace] = None, entity_type: Optional[str] = None, entity_id: Optional[object] = None, metadata: Optional[dict] = None):
+    db.add(AuditLog(
+        workspace_id=workspace.id if workspace else None,
+        user_id=user.id if user else None,
+        action=action,
+        entity_type=entity_type,
+        entity_id=str(entity_id) if entity_id is not None else None,
+        metadata_json=json.dumps(metadata or {}, separators=(",", ":")),
+    ))
+
+
+def check_login_rate_limit(db: Session, username: str):
+    """Reject a username only after too many recent failed logins."""
+    cutoff = datetime.utcnow() - timedelta(seconds=LOGIN_WINDOW_SECONDS)
+    # Sweep expired rows on the way through so the table stays bounded.
+    db.query(LoginAttempt).filter(LoginAttempt.attempted_at < cutoff).delete(synchronize_session=False)
+    recent = db.query(LoginAttempt).filter(
+        LoginAttempt.username_key == username.lower(),
+        LoginAttempt.attempted_at >= cutoff,
+    ).count()
+    db.commit()
+    if recent >= LOGIN_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
+
+
+def record_failed_login(db: Session, username: str):
+    db.add(LoginAttempt(username_key=username.lower(), attempted_at=datetime.utcnow()))
+    db.commit()
+
+
+def clear_login_rate_limit(db: Session, username: str):
+    db.query(LoginAttempt).filter(
+        LoginAttempt.username_key == username.lower()
+    ).delete(synchronize_session=False)
+    db.commit()
+
+# --- Authentication Endpoints ---
+
+@app.post("/api/auth/register", response_model=UserResponseSchema)
+def register_user(payload: UserRegisterSchema, db: Session = Depends(get_db)):
+    # Check duplicate username
+    exists_username = db.query(User).filter(User.username == payload.username).first()
+    if exists_username:
+        raise HTTPException(status_code=400, detail="Username already registered.")
+    
+    exists_email = db.query(User).filter(User.email == payload.email).first()
+    if exists_email:
+        raise HTTPException(status_code=400, detail="Email already registered.")
+        
+    hashed_pwd = get_password_hash(payload.password)
+    db_user = User(
+        username=payload.username,
+        email=payload.email,
+        password_hash=hashed_pwd,
+        is_admin=False,
+        # Every signup waits for an administrator. Set explicitly rather than
+        # relying on a column default so the gate cannot be lost in a migration.
+        is_approved=False,
+    )
+    db.add(db_user)
+    db.flush()
+    workspace = Workspace(
+        name=f"{payload.username}'s Workspace",
+        slug=slugify_workspace(payload.username, db_user.id),
+        owner_user_id=db_user.id,
+    )
+    db.add(workspace)
+    db.flush()
+    db.add(WorkspaceMember(workspace_id=workspace.id, user_id=db_user.id, role="owner"))
+    db.add(Subscription(workspace_id=workspace.id, plan_slug=workspace.plan_slug, status="trialing"))
+    audit(db, "user.registered", db_user, workspace, "user", db_user.id)
+    db.commit()
+    db.refresh(db_user)
+    log_to_db("INFO", f"Registered new user: {payload.username}")
+    return db_user
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login_user(payload: UserLoginSchema, db: Session = Depends(get_db)):
+    check_login_rate_limit(db, payload.username)
+    # Accept either identifier. Accounts are commonly provisioned with an email
+    # as the username, and a browser or password manager will happily fill the
+    # email into this field — matching on username alone rejects a credential
+    # the operator considers correct.
+    identifier = payload.username.strip()
+    user = (
+        db.query(User)
+        .filter(or_(User.username == identifier, User.email == identifier))
+        .first()
+    )
+    if not user or not verify_password(payload.password, user.password_hash):
+        record_failed_login(db, payload.username)
+        raise HTTPException(status_code=400, detail="Incorrect username or password.")
+    if not getattr(user, "is_enabled", True):
+        raise HTTPException(status_code=403, detail="This account is disabled.")
+    if not getattr(user, "is_approved", True):
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is awaiting administrator approval. "
+                   "You will be able to sign in once it is reviewed. "
+                   "Questions? Contact lyvoranlr@gmail.com",
+        )
+
+    clear_login_rate_limit(db, payload.username)
+    token = create_access_token(data={"sub": user.username})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "is_admin": user.is_admin,
+        "username": user.username
+    }
+
+
+# --- SaaS Workspace / Plan / Runner Endpoints ---
+
+@app.get("/api/me")
+def get_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    workspace = active_workspace_for_user(db, current_user)
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "is_admin": current_user.is_admin,
+        "workspace": {
+            "id": workspace.id,
+            "name": workspace.name,
+            "slug": workspace.slug,
+            "plan_slug": workspace.plan_slug,
+            "automation_mode": workspace.automation_mode,
+            "role": workspace_role(db, workspace.id, current_user.id),
+        },
+    }
+
+
+@app.get("/api/plans")
+def list_plans():
+    return [
+        {"slug": slug, "limits": limits}
+        for slug, limits in PLAN_LIMITS.items()
+    ]
+
+
+@app.get("/api/billing/subscription")
+def get_subscription(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    sub = db.query(Subscription).filter(Subscription.workspace_id == workspace.id).order_by(Subscription.id.desc()).first()
+    if not sub:
+        sub = Subscription(
+            workspace_id=workspace.id,
+            plan_slug=workspace.plan_slug,
+            status="trialing",
+            provider="mock",
+        )
+        db.add(sub)
+        db.commit()
+        db.refresh(sub)
+    return {
+        "workspace_id": workspace.id,
+        "plan_slug": sub.plan_slug,
+        "status": sub.status,
+        "provider": sub.provider,
+        "current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
+        "limits": PLAN_LIMITS.get(sub.plan_slug, PLAN_LIMITS["starter"]),
+        "billing_mode": "mock" if sub.provider == "mock" else sub.provider,
+    }
+
+
+@app.get("/api/workspaces", response_model=List[WorkspaceResponse])
+def list_workspaces(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    memberships = db.query(WorkspaceMember).filter(WorkspaceMember.user_id == current_user.id).all()
+    return [
+        WorkspaceResponse(
+            id=m.workspace.id,
+            name=m.workspace.name,
+            slug=m.workspace.slug,
+            plan_slug=m.workspace.plan_slug,
+            automation_mode=m.workspace.automation_mode,
+            role=m.role,
+            created_at=m.workspace.created_at,
+        )
+        for m in memberships
+    ]
+
+
+@app.post("/api/workspaces", response_model=WorkspaceResponse)
+def create_workspace(payload: WorkspaceCreateSchema, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    memberships = db.query(WorkspaceMember).filter(WorkspaceMember.user_id == current_user.id).count()
+    if memberships >= 3 and not current_user.is_admin:
+        raise HTTPException(status_code=402, detail="Workspace limit reached for this account.")
+    workspace = Workspace(
+        name=payload.name,
+        slug=slugify_workspace(payload.name, current_user.id),
+        owner_user_id=current_user.id,
+    )
+    db.add(workspace)
+    db.flush()
+    member = WorkspaceMember(workspace_id=workspace.id, user_id=current_user.id, role="owner")
+    db.add(member)
+    db.add(Subscription(workspace_id=workspace.id, plan_slug=workspace.plan_slug, status="trialing"))
+    audit(db, "workspace.created", current_user, workspace, "workspace", workspace.id)
+    db.commit()
+    db.refresh(workspace)
+    return WorkspaceResponse(
+        id=workspace.id,
+        name=workspace.name,
+        slug=workspace.slug,
+        plan_slug=workspace.plan_slug,
+        automation_mode=workspace.automation_mode,
+        role="owner",
+        created_at=workspace.created_at,
+    )
+
+
+@app.get("/api/campaigns")
+def list_campaigns(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    campaigns = db.query(Campaign).filter(Campaign.workspace_id == workspace.id).order_by(Campaign.id.desc()).all()
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "channel": c.channel,
+            "mode": c.mode,
+            "status": c.status,
+            "consent_source": c.consent_source,
+            "daily_limit": c.daily_limit,
+            "account_id": c.account_id,
+            "template_id": c.template_id,
+            "trigger_keyword": c.trigger_keyword,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in campaigns
+    ]
+
+
+@app.post("/api/campaigns")
+def create_campaign(payload: CampaignCreateSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    campaign_count = db.query(Campaign).filter(Campaign.workspace_id == workspace.id).count()
+    assert_plan_limit(db, workspace, "campaigns", campaign_count)
+
+    if payload.account_id:
+        account = db.query(Account).filter(Account.id == payload.account_id, Account.workspace_id == workspace.id).first()
+        if not account:
+            raise HTTPException(status_code=400, detail="Account does not belong to this workspace.")
+    if payload.template_id:
+        template = db.query(MessageTemplate).filter(MessageTemplate.id == payload.template_id, MessageTemplate.workspace_id == workspace.id).first()
+        if not template:
+            raise HTTPException(status_code=400, detail="Template does not belong to this workspace.")
+
+    campaign = Campaign(
+        workspace_id=workspace.id,
+        name=payload.name,
+        channel=payload.channel,
+        mode=payload.mode,
+        consent_source=payload.consent_source,
+        daily_limit=min(payload.daily_limit, PLAN_LIMITS.get(workspace.plan_slug, PLAN_LIMITS["starter"])["daily_dms"]),
+        account_id=payload.account_id,
+        template_id=payload.template_id,
+        trigger_keyword=payload.trigger_keyword,
+        created_by_user_id=current_user.id,
+    )
+    db.add(campaign)
+    audit(db, "campaign.created", current_user, workspace, "campaign", campaign.id)
+    db.commit()
+    db.refresh(campaign)
+    return {"id": campaign.id, "status": campaign.status}
+
+
+@app.patch("/api/campaigns/{campaign_id}/status")
+def set_campaign_status(campaign_id: int, status_value: str, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    if status_value not in {"draft", "active", "paused", "completed"}:
+        raise HTTPException(status_code=400, detail="Invalid campaign status.")
+    campaign = db.query(Campaign).filter(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id).first()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+    campaign.status = status_value
+    audit(db, "campaign.status_changed", current_user, workspace, "campaign", campaign.id, {"status": status_value})
+    db.commit()
+    return {"id": campaign.id, "status": campaign.status}
+
+
+@app.get("/api/runners")
+def list_runners(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    runners = db.query(AutomationRunner).filter(AutomationRunner.workspace_id == workspace.id).order_by(AutomationRunner.id.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "status": r.status,
+            "runner_type": r.runner_type,
+            "last_seen_at": r.last_seen_at.isoformat() if r.last_seen_at else None,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in runners
+    ]
+
+
+@app.post("/api/runners")
+def create_runner(payload: RunnerCreateSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin")), db: Session = Depends(get_db)):
+    runner_count = db.query(AutomationRunner).filter(AutomationRunner.workspace_id == workspace.id).count()
+    assert_plan_limit(db, workspace, "local_runners", runner_count)
+    token = f"ggr_{secrets.token_urlsafe(32)}"
+    runner = AutomationRunner(
+        workspace_id=workspace.id,
+        name=payload.name,
+        runner_type=payload.runner_type,
+        token_hash=stable_hash(token),
+        status="created",
+    )
+    db.add(runner)
+    audit(db, "runner.created", current_user, workspace, "runner", runner.id)
+    db.commit()
+    db.refresh(runner)
+    return {
+        "id": runner.id,
+        "name": runner.name,
+        "token": token,
+        "message": "Store this token now. It will not be shown again.",
+    }
+
+
+@app.post("/api/runners/heartbeat")
+def runner_heartbeat(authorization: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Runner token is required.")
+    token = authorization.split(" ", 1)[1].strip()
+    runner = db.query(AutomationRunner).filter(AutomationRunner.token_hash == stable_hash(token)).first()
+    if not runner:
+        raise HTTPException(status_code=401, detail="Invalid runner token.")
+    runner.status = "online"
+    runner.last_seen_at = datetime.utcnow()
+    db.commit()
+    return {
+        "ok": True,
+        "runner_id": runner.id,
+        "workspace_id": runner.workspace_id,
+        "status": runner.status,
+        "last_seen_at": runner.last_seen_at.isoformat(),
+    }
+
+# --- Protected User Endpoints ---
+
+@app.get("/api/status")
+def get_system_status(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    # Get active accounts owned by the user
+    user_accounts = db.query(Account).filter(Account.user_id == current_user.id, Account.workspace_id == workspace.id).all()
+    user_account_ids = [a.id for a in user_accounts]
+    active_account = next((a for a in user_accounts if a.status == "connected"), None)
+    active_user = active_account.username if active_account else None
+    
+    # Calculate stats scoped to the user
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    
+    # Targets DMs
+    target_sent_today = db.query(Target).filter(
+        Target.status == "sent",
+        Target.sent_at >= today_start,
+        Target.account_id.in_(user_account_ids)
+    ).count() if user_account_ids else 0
+    
+    # Fetch user monitored posts
+    monitored_posts = db.query(MonitoredPost).filter(MonitoredPost.account_id.in_(user_account_ids)).all() if user_account_ids else []
+    monitored_post_ids = [p.id for p in monitored_posts]
+    
+    # Comment DMs
+    comment_sent_today = db.query(ProcessedComment).filter(
+        ProcessedComment.status == "sent",
+        ProcessedComment.processed_at >= today_start,
+        ProcessedComment.post_id.in_(monitored_post_ids)
+    ).count() if monitored_post_ids else 0
+    
+    sent_today = target_sent_today + comment_sent_today
+    
+    pending_count = db.query(Target).filter(
+        Target.status == "pending",
+        Target.account_id.in_(user_account_ids)
+    ).count() if user_account_ids else 0
+    
+    target_failed = db.query(Target).filter(Target.status == "failed", Target.account_id.in_(user_account_ids)).count() if user_account_ids else 0
+    comment_failed = db.query(ProcessedComment).filter(ProcessedComment.status == "failed", ProcessedComment.post_id.in_(monitored_post_ids)).count() if monitored_post_ids else 0
+    failed_count = target_failed + comment_failed
+    
+    target_total_sent = db.query(Target).filter(Target.status == "sent", Target.account_id.in_(user_account_ids)).count() if user_account_ids else 0
+    comment_total_sent = db.query(ProcessedComment).filter(ProcessedComment.status == "sent", ProcessedComment.post_id.in_(monitored_post_ids)).count() if monitored_post_ids else 0
+    total_sent = target_total_sent + comment_total_sent
+    
+    system_running = bot_module.BOT_RUNNING
+    user_active = getattr(current_user, "automation_active", False)
+
+    # A workspace outside its working-hours window is idle by design. Without
+    # reporting it, the dashboard shows "running" while nothing happens and a
+    # paused schedule is indistinguishable from a broken worker.
+    ws_settings = get_workspace_settings(db, workspace.id)
+    work_start = ws_settings["working_hours_start"]
+    work_end = ws_settings["working_hours_end"]
+    within_hours = bot_module.is_within_working_hours(work_start, work_end)
+
+    return {
+        "bot_running": system_running and user_active,
+        "system_running": system_running,
+        "user_automation_active": user_active,
+        "within_working_hours": within_hours,
+        "working_hours_start": work_start,
+        "working_hours_end": work_end,
+        "active_account": active_user,
+        "sent_today": sent_today,
+        "pending_count": pending_count,
+        "failed_count": failed_count,
+        "total_sent": total_sent
+    }
+
+# Account management
+@app.get("/api/accounts", response_model=List[AccountResponse])
+def list_accounts(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    return db.query(Account).filter(Account.user_id == current_user.id, Account.workspace_id == workspace.id).all()
+
+@app.post("/api/accounts", response_model=AccountResponse)
+def add_account(payload: AccountSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    account_count = db.query(Account).filter(Account.workspace_id == workspace.id).count()
+    assert_plan_limit(db, workspace, "instagram_accounts", account_count)
+    # Check duplicate handle globally
+    exists = db.query(Account).filter(Account.username == payload.username).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="Account handle is already linked.")
+        
+    db_account = Account(
+        username=payload.username,
+        password=encrypt_secret(payload.password),
+        status="disconnected",
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        proxy_host=payload.proxy_host,
+        proxy_port=payload.proxy_port,
+        proxy_username=payload.proxy_username,
+        proxy_password=encrypt_secret(payload.proxy_password)
+    )
+    db.add(db_account)
+    audit(db, "instagram_account.linked", current_user, workspace, "account", db_account.id, {"username": payload.username})
+    db.commit()
+    db.refresh(db_account)
+    log_to_db("INFO", f"User {current_user.username} linked new account: @{payload.username}")
+    return db_account
+
+@app.delete("/api/accounts/{username}")
+def delete_account(username: str, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.username == username, Account.user_id == current_user.id, Account.workspace_id == workspace.id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+        
+    db.delete(account)
+    db.commit()
+    log_to_db("WARNING", f"User {current_user.username} deleted account: @{username}")
+    return {"message": f"Account @{username} successfully removed."}
+
+# Verification & login routines
+_account_auth_jobs = set()
+_account_auth_jobs_lock = threading.Lock()
+
+def claim_account_auth_job(account_id: int) -> bool:
+    with _account_auth_jobs_lock:
+        if account_id in _account_auth_jobs:
+            return False
+        _account_auth_jobs.add(account_id)
+        return True
+
+def release_account_auth_job(account_id: int) -> None:
+    with _account_auth_jobs_lock:
+        _account_auth_jobs.discard(account_id)
+
+def run_login_worker(account_id: int, username: str, proxy_config: Optional[dict] = None):
+    bot = InstagramBot(username, proxy=proxy_config)
+    loop = create_browser_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        success = loop.run_until_complete(bot.run_manual_login_session())
+        db = SessionLocal()
+        try:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            if account:
+                account.status = "connected" if success else "disconnected"
+                db.commit()
+        finally:
+            db.close()
+    except BaseException as e:
+        log_to_db("ERROR", f"Manual login worker failed for @{username}: {type(e).__name__}: {e!r}")
+        db = SessionLocal()
+        try:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            if account:
+                account.status = "authentication_error"
+                db.commit()
+        finally:
+            db.close()
+    finally:
+        release_account_auth_job(account_id)
+        loop.close()
+
+@app.post("/api/accounts/{username}/login")
+def trigger_manual_login(
+    username: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    account = db.query(Account).filter(
+        Account.username == username,
+        Account.user_id == current_user.id,
+        Account.workspace_id == workspace.id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    if not claim_account_auth_job(account.id):
+        raise HTTPException(status_code=409, detail="Authentication or verification is already running for this account. Please wait for it to finish.")
+
+    proxy_config = None
+    if account.proxy_host and account.proxy_port:
+        proxy_config = {"server": f"http://{account.proxy_host}:{account.proxy_port}"}
+        if account.proxy_username and account.proxy_password:
+            proxy_config["username"] = account.proxy_username
+            proxy_config["password"] = decrypt_secret(account.proxy_password)
+    try:
+        account.status = "connecting"
+        db.commit()
+        background_tasks.add_task(run_login_worker, account.id, username, proxy_config)
+    except Exception:
+        release_account_auth_job(account.id)
+        raise
+    return {"message": "Visible browser window launched on host. Please log in manually."}
+
+@app.post("/api/accounts/{username}/mark-connected", deprecated=True)
+@app.post("/api/accounts/{username}/verify")
+def verify_account_session(
+    username: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    account = db.query(Account).filter(
+        Account.username == username,
+        Account.user_id == current_user.id,
+        Account.workspace_id == workspace.id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    if not claim_account_auth_job(account.id):
+        raise HTTPException(status_code=409, detail="Authentication or verification is already running for this account. Please wait for it to finish.")
+
+    proxy_config = None
+    if account.proxy_host and account.proxy_port:
+        proxy_config = {"server": f"http://{account.proxy_host}:{account.proxy_port}"}
+        if account.proxy_username and account.proxy_password:
+            proxy_config["username"] = account.proxy_username
+            proxy_config["password"] = decrypt_secret(account.proxy_password)
+
+    try:
+        account.status = "connecting"
+        db.commit()
+        background_tasks.add_task(run_verification_worker, account.id, username, proxy_config)
+    except Exception:
+        release_account_auth_job(account.id)
+        raise
+    return {"status": "connecting", "message": f"Session verification started for @{username}."}
+
+def run_verification_worker(account_id: int, username: str, proxy_config: Optional[dict] = None):
+    bot = InstagramBot(username, proxy=proxy_config)
+    loop = create_browser_event_loop()
+    asyncio.set_event_loop(loop)
+    is_logged = False
+    verification_error = None
+    try:
+        loop.run_until_complete(bot.init_browser(headless=True, persistent=False))
+        is_logged = bool(loop.run_until_complete(bot.check_login_status()))
+    except BaseException as e:
+        verification_error = e
+        log_to_db("ERROR", f"Instagram session verification failed for @{username}: {type(e).__name__}: {e!r}")
+    finally:
+        try:
+            loop.run_until_complete(bot.close_browser())
+        except Exception as close_error:
+            log_to_db("WARNING", f"Could not close verification browser for @{username}: {close_error}")
+
+        db = SessionLocal()
+        try:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            if account:
+                account.status = "authentication_error" if verification_error else ("connected" if is_logged else "verification_needed")
+                db.commit()
+                level = "SUCCESS" if is_logged else "WARNING"
+                result = "verified" if is_logged else ("could not be checked" if verification_error else "not authenticated")
+                log_to_db(level, f"Instagram session for @{username} is {result}.")
+        finally:
+            db.close()
+        release_account_auth_job(account_id)
+        loop.close()
+
+@app.post("/api/accounts/{username}/session")
+async def save_session_cookies(
+    username: str, 
+    request: Request, 
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    from backend.config import settings
+    account = db.query(Account).filter(Account.username == username, Account.user_id == current_user.id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+        
+    try:
+        payload = await request.json()
+        normalized = normalize_cookies_to_storage_state(payload)
+        if not normalized["cookies"]:
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cookie session JSON payload structure.")
+
+    cookie_names = {cookie["name"] for cookie in normalized["cookies"]}
+    missing_required = {"sessionid", "ds_user_id"} - cookie_names
+    if missing_required:
+        missing = ", ".join(sorted(missing_required))
+        raise HTTPException(status_code=400, detail=f"The JSON is not a logged-in Instagram session. Missing required cookie(s): {missing}.")
+    if not claim_account_auth_job(account.id):
+        raise HTTPException(status_code=409, detail="Authentication or verification is already running for this account. Please wait for it to finish.")
+
+    try:
+        user_data_path = os.path.abspath(os.path.join(settings.USER_DATA_DIR, username))
+        os.makedirs(user_data_path, exist_ok=True)
+        storage_state_file = os.path.join(user_data_path, "storage_state.json")
+        with open(storage_state_file, "w", encoding="utf-8") as f:
+            json.dump(normalized, f, indent=2)
+
+        account.status = "connecting"
+        db.commit()
+
+        proxy_config = None
+        if account.proxy_host and account.proxy_port:
+            proxy_config = {
+                "server": f"http://{account.proxy_host}:{account.proxy_port}"
+            }
+            if account.proxy_username and account.proxy_password:
+                proxy_config["username"] = account.proxy_username
+                proxy_config["password"] = decrypt_secret(account.proxy_password)
+
+        background_tasks.add_task(run_verification_worker, account.id, username, proxy_config)
+    except Exception:
+        release_account_auth_job(account.id)
+        raise
+    return {"status": "connecting", "message": "Cookies imported successfully. Triggering validation..."}
+
+def normalize_cookies_to_storage_state(cookie_data) -> dict:
+    cookies = []
+    origins = []
+    if isinstance(cookie_data, dict):
+        raw_cookies = cookie_data.get("cookies", [])
+        origins = cookie_data.get("origins", [])
+    elif isinstance(cookie_data, list):
+        raw_cookies = cookie_data
+    else:
+        raise ValueError("Invalid format")
+
+    for rc in raw_cookies:
+        if not isinstance(rc, dict):
+            continue
+        name = rc.get("name")
+        value = rc.get("value")
+        domain = rc.get("domain")
+        path = rc.get("path", "/")
+        if not name or not value or not domain:
+            continue
+        normalized_domain = str(domain).lower().lstrip(".")
+        if normalized_domain != "instagram.com" and not normalized_domain.endswith(".instagram.com"):
+            continue
+            
+        same_site_value = str(rc.get("sameSite", rc.get("same_site", "Lax"))).lower()
+        same_site = {
+            "strict": "Strict",
+            "lax": "Lax",
+            "none": "None",
+            "no_restriction": "None",
+            "unspecified": "Lax",
+        }.get(same_site_value, "Lax")
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path,
+            "httpOnly": rc.get("httpOnly", rc.get("http_only", True)),
+            "secure": rc.get("secure", True),
+            "sameSite": same_site
+        }
+        expires = rc.get("expires", rc.get("expirationDate"))
+        if isinstance(expires, str):
+            try:
+                expires = float(expires)
+            except ValueError:
+                expires = None
+        if isinstance(expires, (int, float)) and expires > 0:
+            cookie["expires"] = expires
+        cookies.append(cookie)
+        
+    return {"cookies": cookies, "origins": origins}
+
+# Target Queue endpoints
+@app.get("/api/targets", response_model=List[TargetResponse])
+def list_targets(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    user_accounts = db.query(Account).filter(Account.user_id == current_user.id, Account.workspace_id == workspace.id).all()
+    user_account_ids = [a.id for a in user_accounts]
+    return db.query(Target).filter(Target.account_id.in_(user_account_ids)).order_by(Target.id.desc()).all() if user_account_ids else []
+
+@app.post("/api/targets", response_model=List[TargetResponse])
+def add_targets(payload: TargetCreateSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    # Verify account ownership
+    account = db.query(Account).filter(Account.id == payload.account_id, Account.user_id == current_user.id, Account.workspace_id == workspace.id).first()
+    if not account:
+        raise HTTPException(status_code=400, detail="Invalid associated account ID.")
+        
+    added_targets = []
+    for uname in payload.usernames:
+        uname = uname.strip().replace("@", "")
+        if not uname:
+            continue
+        exists = db.query(Target).filter(Target.username == uname, Target.account_id == payload.account_id).first()
+        if exists:
+            if exists.status == "failed":
+                exists.status = "pending"
+                exists.error_message = None
+                added_targets.append(exists)
+            continue
+            
+        new_target = Target(username=uname, status="pending", account_id=payload.account_id)
+        db.add(new_target)
+        added_targets.append(new_target)
+        
+    db.commit()
+    for item in added_targets:
+        db.refresh(item)
+    return added_targets
+
+@app.post("/api/targets/upload")
+async def upload_targets(
+    account_id: int, 
+    file: UploadFile = File(...), 
+    current_user: User = Depends(get_current_user), 
+    workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")),
+    db: Session = Depends(get_db)
+):
+    account = db.query(Account).filter(Account.id == account_id, Account.user_id == current_user.id, Account.workspace_id == workspace.id).first()
+    if not account:
+        raise HTTPException(status_code=400, detail="Invalid associated account ID.")
+        
+    content = await file.read()
+    text = content.decode("utf-8")
+    usernames = []
+    for line in text.splitlines():
+        parts = re.split(r'[,\s]+', line)
+        for part in parts:
+            part = part.strip().replace("@", "")
+            if part:
+                usernames.append(part)
+                
+    added = 0
+    for uname in usernames:
+        exists = db.query(Target).filter(Target.username == uname, Target.account_id == account_id).first()
+        if not exists:
+            db.add(Target(username=uname, status="pending", account_id=account_id))
+            added += 1
+            
+    db.commit()
+    return {"message": f"Successfully imported {added} new targets."}
+
+@app.delete("/api/targets")
+def clear_all_targets(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    user_accounts = db.query(Account).filter(Account.user_id == current_user.id, Account.workspace_id == workspace.id).all()
+    user_account_ids = [a.id for a in user_accounts]
+    if user_account_ids:
+        db.query(Target).filter(Target.account_id.in_(user_account_ids)).delete(synchronize_session=False)
+        db.commit()
+    return {"message": "All targets cleared."}
+
+@app.delete("/api/targets/{id}")
+def delete_target(id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    target = db.query(Target).filter(Target.id == id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found.")
+    account = db.query(Account).filter(Account.id == target.account_id, Account.user_id == current_user.id, Account.workspace_id == workspace.id).first()
+    if not account:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    db.delete(target)
+    db.commit()
+    return {"message": "Target removed."}
+
+# Message Template management
+@app.get("/api/messages", response_model=List[MessageTemplateResponse])
+def list_messages(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    return db.query(MessageTemplate).filter(MessageTemplate.user_id == current_user.id, MessageTemplate.workspace_id == workspace.id).all()
+
+@app.post("/api/messages", response_model=MessageTemplateResponse)
+def add_message(payload: MessageTemplateSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    db_tpl = MessageTemplate(
+        name=payload.name,
+        content=payload.content,
+        is_active=payload.is_active,
+        user_id=current_user.id,
+        workspace_id=workspace.id
+    )
+    db.add(db_tpl)
+    audit(db, "template.created", current_user, workspace, "message_template", db_tpl.id)
+    db.commit()
+    db.refresh(db_tpl)
+    return db_tpl
+
+@app.patch("/api/messages/{id}")
+def toggle_message_status(id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    tpl = db.query(MessageTemplate).filter(MessageTemplate.id == id, MessageTemplate.user_id == current_user.id, MessageTemplate.workspace_id == workspace.id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    tpl.is_active = not tpl.is_active
+    db.commit()
+    return tpl
+
+@app.put("/api/messages/{id}", response_model=MessageTemplateResponse)
+def update_message(id: int, payload: MessageTemplateUpdateSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    tpl = db.query(MessageTemplate).filter(MessageTemplate.id == id, MessageTemplate.user_id == current_user.id, MessageTemplate.workspace_id == workspace.id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    tpl.name = payload.name.strip()
+    tpl.content = payload.content.strip()
+    audit(db, "template.updated", current_user, workspace, "message_template", tpl.id)
+    db.commit()
+    db.refresh(tpl)
+    return tpl
+
+@app.delete("/api/messages/{id}")
+def delete_message(id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    tpl = db.query(MessageTemplate).filter(MessageTemplate.id == id, MessageTemplate.user_id == current_user.id, MessageTemplate.workspace_id == workspace.id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    db.delete(tpl)
+    db.commit()
+    return {"message": "Template deleted."}
+
+@app.post("/api/ai/sophie", response_model=AISophieResponse)
+async def ask_sophie_ai(
+    payload: AISophieRequest,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db)
+):
+    api_key = settings.NVIDIA_API_KEY.strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="NVIDIA API key not configured on backend.")
+    
+    system_instruction = (
+        "You are Sophie, a helpful and highly creative AI copywriting assistant integrated into the Lyvora platform.\n"
+        "Your task is to write high-converting outreach messages for social media automation.\n"
+        f"Platform target: {payload.platform} (e.g. Instagram DMs or Telegram broadcasts).\n"
+        f"Tone of voice: {payload.tone}.\n"
+        "CRITICAL RULES:\n"
+        "- Keep the message short, concise, and simple (maximum 2 to 3 sentences total).\n"
+        "- Do NOT include any email-style signatures, sign-offs, or placeholders (e.g., do NOT write 'Best regards', 'Sincerely', '[Your Name]', or '[Company Name]').\n"
+        "- You MUST generate messages that contain spintax variations (e.g., '{Hello|Hi|Hey} {username}, {how are you|hope you're well}!') to keep each variant unique and natural.\n"
+        "- Use the placeholder '{username}' or '@username' (for Instagram) where the recipient's username should be inserted.\n"
+        "- Output ONLY the final message template. Do not include any introductory sentences, explanations, or markdown code blocks (like ```)."
+    )
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": "meta/llama-3.1-8b-instruct",
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": payload.prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1024
+    }
+    
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json=data)
+            
+            if response.status_code != 200:
+                error_detail = response.text
+                log_to_db("ERROR", f"[AI] Sophie API error: {response.status_code} - {error_detail}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"NVIDIA API responded with error status {response.status_code}."
+                )
+                
+            resp_json = response.json()
+            generated_text = resp_json["choices"][0]["message"]["content"].strip()
+            
+            if generated_text.startswith("```"):
+                lines = generated_text.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                generated_text = "\n".join(lines).strip()
+                
+            log_to_db("INFO", f"User '{current_user.username}' generated template using Sophie AI assistant.")
+            return AISophieResponse(text=generated_text)
+            
+    except httpx.RequestError as exc:
+        log_to_db("ERROR", f"[AI] Sophie network request failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="NVIDIA NIM API server connection timed out or failed. Please check backend internet connectivity."
+        )
+
+# Monitored Posts CRUD
+@app.get("/api/posts", response_model=List[MonitoredPostResponse])
+def list_monitored_posts(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    user_accounts = db.query(Account).filter(Account.user_id == current_user.id, Account.workspace_id == workspace.id).all()
+    user_account_ids = [a.id for a in user_accounts]
+    return db.query(MonitoredPost).filter(MonitoredPost.account_id.in_(user_account_ids)).all() if user_account_ids else []
+
+@app.post("/api/posts", response_model=MonitoredPostResponse)
+def add_monitored_post(payload: MonitoredPostCreate, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == payload.account_id, Account.user_id == current_user.id, Account.workspace_id == workspace.id).first()
+    if not account:
+        raise HTTPException(status_code=400, detail="Invalid associated account ID.")
+    tpl = db.query(MessageTemplate).filter(MessageTemplate.id == payload.template_id, MessageTemplate.user_id == current_user.id, MessageTemplate.workspace_id == workspace.id).first()
+    if not tpl:
+        raise HTTPException(status_code=400, detail="Associated message template not found.")
+        
+    db_post = MonitoredPost(
+        post_url=payload.post_url,
+        trigger_keyword=payload.trigger_keyword,
+        match_mode=payload.match_mode,
+        template_id=payload.template_id,
+        is_active=payload.is_active,
+        account_id=payload.account_id
+    )
+    db.add(db_post)
+    audit(db, "monitored_post.created", current_user, workspace, "monitored_post", None,
+          {"match_mode": payload.match_mode, "post_url": payload.post_url})
+    db.commit()
+    db.refresh(db_post)
+    if payload.match_mode == "any":
+        log_to_db("WARNING",
+                  f"Monitored post {db_post.id} set to reply to ANY comment. "
+                  f"Outreach to people who did not use a keyword — blocklist and limits still apply.")
+    return db_post
+
+@app.delete("/api/posts/{id}")
+def delete_monitored_post(id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    post = db.query(MonitoredPost).filter(MonitoredPost.id == id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Monitored post not found.")
+    account = db.query(Account).filter(Account.id == post.account_id, Account.user_id == current_user.id, Account.workspace_id == workspace.id).first()
+    if not account:
+        raise HTTPException(status_code=403, detail="Forbidden")
+        
+    db.query(ProcessedComment).filter(ProcessedComment.post_id == id).delete()
+    db.delete(post)
+    db.commit()
+    return {"message": "Monitored post removed."}
+
+# History
+@app.get("/api/history", response_model=List[ProcessedCommentResponse])
+def get_trigger_history(limit: int = 100, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    user_accounts = db.query(Account).filter(Account.user_id == current_user.id, Account.workspace_id == workspace.id).all()
+    user_account_ids = [a.id for a in user_accounts]
+    if not user_account_ids:
+        return []
+        
+    user_posts = db.query(MonitoredPost).filter(MonitoredPost.account_id.in_(user_account_ids)).all()
+    user_post_ids = [p.id for p in user_posts]
+    if not user_post_ids:
+        return []
+        
+    history = db.query(ProcessedComment).filter(ProcessedComment.post_id.in_(user_post_ids)).order_by(ProcessedComment.processed_at.desc()).limit(limit).all()
+    result = []
+    for item in history:
+        post = next((p for p in user_posts if p.id == item.post_id), None)
+        result.append(ProcessedCommentResponse(
+            id=item.id,
+            username=item.username,
+            post_id=item.post_id,
+            comment_text=item.comment_text,
+            status=item.status,
+            processed_at=item.processed_at,
+            post_url=post.post_url if post else "Deleted Post",
+            trigger_keyword=post.trigger_keyword if post else "N/A"
+        ))
+    return result
+
+# Opt-outs
+@app.get("/api/optouts", response_model=List[OptOutResponse])
+def list_optouts(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    return db.query(OptOut).filter(OptOut.user_id == current_user.id, OptOut.workspace_id == workspace.id).order_by(OptOut.id.desc()).all()
+
+@app.post("/api/optouts", response_model=OptOutResponse)
+def add_optout(payload: OptOutCreateSchema, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    clean_username = payload.username.strip().lower().replace("@", "")
+    if not clean_username:
+        raise HTTPException(status_code=400, detail="Invalid username.")
+    exists = db.query(OptOut).filter(OptOut.username == clean_username, OptOut.user_id == current_user.id, OptOut.workspace_id == workspace.id).first()
+    if exists:
+        return exists
+    db_optout = OptOut(username=clean_username, user_id=current_user.id, workspace_id=workspace.id)
+    db.add(db_optout)
+    db.commit()
+    db.refresh(db_optout)
+    return db_optout
+
+@app.delete("/api/optouts/{id}")
+def delete_optout(id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    optout = db.query(OptOut).filter(OptOut.id == id, OptOut.user_id == current_user.id, OptOut.workspace_id == workspace.id).first()
+    if not optout:
+        raise HTTPException(status_code=404, detail="Blocklist entry not found.")
+    db.delete(optout)
+    db.commit()
+    return {"message": "Blocklist entry removed."}
+
+# Settings Control
+@app.get("/api/settings")
+def get_settings(
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    settings_dict = get_workspace_settings(db, workspace.id)
+    connection = db.query(MetaConnection).filter(MetaConnection.workspace_id == workspace.id).first()
+    settings_dict["api_mode"] = "official" if connection and connection.is_active else "sandbox"
+    settings_dict["meta_connection_configured"] = bool(connection and secret_configured(connection.access_token))
+    settings_dict["meta_connection_active"] = bool(connection and connection.is_active)
+    settings_dict["meta_connection_status"] = connection.status if connection else "not_connected"
+    settings_dict["meta_instagram_user_id"] = connection.instagram_user_id if connection else ""
+    settings_dict["meta_instagram_username"] = connection.instagram_username if connection else ""
+    settings_dict["meta_access_token_masked"] = mask_secret(connection.access_token) if connection else ""
+    settings_dict["meta_app_id_configured"] = bool(settings.META_APP_ID.strip())
+    settings_dict["meta_app_secret_configured"] = bool(settings.META_APP_SECRET.strip())
+    settings_dict["meta_webhook_verify_token_configured"] = bool(settings.META_WEBHOOK_VERIFY_TOKEN.strip())
+    settings_dict["meta_platform_configured"] = bool(
+        settings.META_APP_SECRET.strip() and settings.META_WEBHOOK_VERIFY_TOKEN.strip()
+    )
+    return settings_dict
+
+@app.post("/api/settings")
+def update_settings(
+    payload: SettingUpdateSchema,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")),
+    db: Session = Depends(get_db),
+):
+    if payload.max_delay < payload.min_delay:
+        raise HTTPException(status_code=400, detail="Max delay must be greater than or equal to min delay.")
+    try:
+        datetime.strptime(payload.working_hours_start, "%H:%M")
+        datetime.strptime(payload.working_hours_end, "%H:%M")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Working hours must use HH:MM format.")
+    if payload.api_mode not in {"sandbox", "official"}:
+        raise HTTPException(status_code=400, detail="Invalid messaging engine mode.")
+    if not payload.consent_enforce:
+        raise HTTPException(status_code=400, detail="Exact comment-keyword consent must remain enabled for safe automation.")
+
+    opt_out_keywords = []
+    for keyword in payload.opt_out_keywords.split(","):
+        normalized = keyword.strip().casefold()
+        if normalized and normalized not in opt_out_keywords:
+            opt_out_keywords.append(normalized)
+    if not opt_out_keywords:
+        raise HTTPException(status_code=400, detail="Add at least one opt-out keyword.")
+
+    connection = db.query(MetaConnection).filter(MetaConnection.workspace_id == workspace.id).first()
+    if payload.api_mode == "official":
+        if not settings.META_APP_SECRET.strip() or not settings.META_WEBHOOK_VERIFY_TOKEN.strip():
+            raise HTTPException(status_code=400, detail="The Lyvora Meta app is not ready on the backend yet.")
+        if not connection or connection.status != "connected" or not secret_configured(connection.access_token):
+            raise HTTPException(status_code=400, detail="Connect and validate your Instagram access token before enabling Official Meta mode.")
+        connection.is_active = True
+    elif connection:
+        connection.is_active = False
+
+    items = {
+        "daily_limit": str(payload.daily_limit),
+        "min_delay": str(payload.min_delay),
+        "max_delay": str(payload.max_delay),
+        "working_hours_start": payload.working_hours_start,
+        "working_hours_end": payload.working_hours_end,
+        "opt_out_keywords": ", ".join(opt_out_keywords),
+        "consent_enforce": "true",
+    }
+    for k, v in items.items():
+        set_workspace_setting(db, workspace.id, k, v)
+    db.commit()
+    log_to_db("INFO", f"User '{current_user.username}' updated bot settings.")
+    return {"message": "Settings saved successfully."}
+
+
+@app.get("/api/meta/connection")
+def get_meta_connection(
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    connection = db.query(MetaConnection).filter(MetaConnection.workspace_id == workspace.id).first()
+    if not connection:
+        return {"connected": False, "active": False, "status": "not_connected"}
+    return {
+        "connected": secret_configured(connection.access_token),
+        "active": connection.is_active,
+        "status": connection.status,
+        "instagram_user_id": connection.instagram_user_id,
+        "instagram_username": connection.instagram_username,
+        "access_token_masked": mask_secret(connection.access_token),
+        "last_validated_at": connection.last_validated_at,
+    }
+
+
+@app.post("/api/meta/connection")
+async def save_meta_connection(
+    payload: MetaConnectionCreateSchema,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(require_workspace_role("owner", "admin")),
+    db: Session = Depends(get_db),
+):
+    """Validate a tenant token with Meta, then persist only its encrypted form."""
+    version = settings.META_GRAPH_API_VERSION.strip() or "v23.0"
+    url = f"https://graph.instagram.com/{version}/{payload.instagram_user_id}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                url,
+                params={"fields": "id,username"},
+                headers={"Authorization": f"Bearer {payload.access_token}"},
+            )
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="Could not reach Meta to validate this connection. Try again shortly.")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Meta rejected this token. Check the token, account ID, permissions, and expiry.")
+    profile = response.json()
+    returned_id = str(profile.get("id") or "")
+    if returned_id != payload.instagram_user_id:
+        raise HTTPException(status_code=400, detail="This token belongs to a different Instagram account ID.")
+
+    duplicate = db.query(MetaConnection).filter(
+        MetaConnection.instagram_user_id == payload.instagram_user_id,
+        MetaConnection.workspace_id != workspace.id,
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="This Instagram account is already connected to another workspace.")
+
+    connection = db.query(MetaConnection).filter(MetaConnection.workspace_id == workspace.id).first()
+    if not connection:
+        connection = MetaConnection(workspace_id=workspace.id)
+        db.add(connection)
+    connection.connected_by_user_id = current_user.id
+    connection.instagram_user_id = payload.instagram_user_id
+    connection.instagram_username = (profile.get("username") or "").strip() or None
+    connection.access_token = encrypt_secret(payload.access_token)
+    connection.token_hash = stable_hash(payload.access_token)
+    connection.status = "connected"
+    connection.last_validated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(connection)
+    log_to_db("INFO", f"User '{current_user.username}' connected an official Meta account for workspace {workspace.id}.")
+    return {
+        "connected": True,
+        "active": connection.is_active,
+        "status": connection.status,
+        "instagram_user_id": connection.instagram_user_id,
+        "instagram_username": connection.instagram_username,
+        "access_token_masked": mask_secret(connection.access_token),
+        "last_validated_at": connection.last_validated_at,
+    }
+
+
+@app.delete("/api/meta/connection")
+def delete_meta_connection(
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(require_workspace_role("owner", "admin")),
+    db: Session = Depends(get_db),
+):
+    connection = db.query(MetaConnection).filter(MetaConnection.workspace_id == workspace.id).first()
+    if not connection:
+        raise HTTPException(status_code=404, detail="No Meta connection was found for this workspace.")
+    db.delete(connection)
+    db.commit()
+    log_to_db("INFO", f"User '{current_user.username}' disconnected the official Meta account for workspace {workspace.id}.")
+    return {"message": "Meta account disconnected and its stored token was removed."}
+
+@app.get("/api/logs", response_model=List[LogResponse])
+def get_logs(limit: int = 100, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.query(BotLog).order_by(BotLog.timestamp.desc()).limit(limit).all()
+
+# Bot Control (Admin Protected)
+@app.post("/api/bot/start")
+def start_bot(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not bot_module.BOT_RUNNING:
+        raise HTTPException(status_code=403, detail="System automation is not enabled. Ask an admin to start the system first.")
+    current_user.automation_active = True
+    db.commit()
+    log_to_db("INFO", f"User @{current_user.username} activated their automation.")
+    return {"status": "running", "message": "Your automation is now active."}
+
+@app.post("/api/bot/stop")
+def stop_bot(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    current_user.automation_active = False
+    db.commit()
+    log_to_db("INFO", f"User @{current_user.username} paused their automation.")
+    return {"status": "stopped", "message": "Your automation is now paused."}
+
+# --- Dedicated Admin Panel Metrics & Reporting Endpoints ---
+
+@app.get("/api/admin/users")
+def admin_list_users(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    users = db.query(User).all()
+    result = []
+    for u in users:
+        accounts = db.query(Account).filter(Account.user_id == u.id).all()
+        account_ids = [a.id for a in accounts]
+
+        dms_sent = 0
+        dms_failed = 0
+        pending = 0
+        if account_ids:
+            sent_query = db.query(Target).filter(Target.account_id.in_(account_ids), Target.status == "sent")
+            if u.cost_reset_at:
+                sent_query = sent_query.filter(Target.sent_at >= u.cost_reset_at)
+            dms_sent += sent_query.count()
+            dms_failed += db.query(Target).filter(Target.account_id.in_(account_ids), Target.status == "failed").count()
+            pending += db.query(Target).filter(Target.account_id.in_(account_ids), Target.status == "pending").count()
+            post_ids = [p.id for p in db.query(MonitoredPost).filter(MonitoredPost.account_id.in_(account_ids)).all()]
+            if post_ids:
+                comment_query = db.query(ProcessedComment).filter(ProcessedComment.post_id.in_(post_ids), ProcessedComment.status == "sent")
+                if u.cost_reset_at:
+                    comment_query = comment_query.filter(ProcessedComment.processed_at >= u.cost_reset_at)
+                dms_sent += comment_query.count()
+                dms_failed += db.query(ProcessedComment).filter(ProcessedComment.post_id.in_(post_ids), ProcessedComment.status == "failed").count()
+
+        tg_bot_objs = db.query(TgBotConfig).filter(TgBotConfig.user_id == u.id).all()
+        tg_bots_count = len(tg_bot_objs)
+        tg_channels_count = 0
+        tg_posts_sent = 0
+        if tg_bot_objs:
+            tg_bot_ids = [b.id for b in tg_bot_objs]
+            tg_channels = db.query(TgChannel).filter(TgChannel.bot_id.in_(tg_bot_ids)).all()
+            tg_channels_count = len(tg_channels)
+            if tg_channels:
+                ch_ids = [ch.id for ch in tg_channels]
+                tg_query = db.query(TgScheduledPost).filter(
+                    TgScheduledPost.channel_id.in_(ch_ids),
+                    TgScheduledPost.status == "sent"
+                )
+                if u.cost_reset_at:
+                    tg_query = tg_query.filter(TgScheduledPost.sent_at >= u.cost_reset_at)
+                tg_posts_sent = tg_query.count()
+
+        ig_cost = round(dms_sent * 0.45, 2)
+        tg_cost = round(tg_posts_sent * 0.27, 2)
+        total_cost = round(ig_cost + tg_cost, 2)
+
+        acct_schemas = [
+            {"id": a.id, "username": a.username, "status": a.status,
+             "proxy_host": a.proxy_host, "proxy_port": a.proxy_port,
+             "created_at": a.created_at.isoformat()}
+            for a in accounts
+        ]
+        result.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "is_admin": u.is_admin,
+            "is_enabled": getattr(u, "is_enabled", True),
+            "is_approved": getattr(u, "is_approved", False),
+            "created_at": u.created_at.isoformat(),
+            "accounts": acct_schemas,
+            "ig_accounts": len(accounts),
+            "dms_sent": dms_sent,
+            "dms_failed": dms_failed,
+            "pending": pending,
+            "tg_bots": tg_bots_count,
+            "tg_channels": tg_channels_count,
+            "tg_posts_sent": tg_posts_sent,
+            "ig_cost": ig_cost,
+            "tg_cost": tg_cost,
+            "total_cost": total_cost,
+        })
+    return result
+
+
+@app.post("/api/admin/users/{user_id}/reset-cost")
+def admin_reset_user_cost(user_id: int, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(404, "User not found")
+    target_user.cost_reset_at = datetime.utcnow()
+    db.commit()
+    log_to_db("WARNING", f"Admin {current_admin.username} reset usage cost for @{target_user.username}")
+    return {"ok": True, "reset_at": target_user.cost_reset_at.isoformat()}
+
+@app.patch("/api/admin/users/{user_id}/toggle-admin")
+def admin_toggle_admin(user_id: int, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target_user.id == current_admin.id:
+        raise HTTPException(status_code=400, detail="You cannot change your own admin status.")
+    target_user.is_admin = not target_user.is_admin
+    db.commit()
+    action = "granted" if target_user.is_admin else "revoked"
+    log_to_db("WARNING", f"Admin {current_admin.username} {action} admin privileges for @{target_user.username}")
+    return {"message": f"Admin privileges {action} for @{target_user.username}."}
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: int, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target_user.id == current_admin.id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    username = target_user.username
+    db.delete(target_user)
+    db.commit()
+    log_to_db("WARNING", f"Admin {current_admin.username} deleted user @{username} and all associated data.")
+    return {"message": f"User @{username} permanently deleted."}
+
+@app.get("/api/admin/stats")
+def admin_system_stats(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    total_users = db.query(User).count()
+    total_accounts = db.query(Account).count()
+    total_targets_sent = db.query(Target).filter(Target.status == "sent").count()
+    total_comments_sent = db.query(ProcessedComment).filter(ProcessedComment.status == "sent").count()
+    total_targets_failed = db.query(Target).filter(Target.status == "failed").count()
+    total_comments_failed = db.query(ProcessedComment).filter(ProcessedComment.status == "failed").count()
+    total_pending_targets = db.query(Target).filter(Target.status == "pending").count()
+
+    total_tg_bots = db.query(TgBotConfig).count()
+    total_tg_channels = db.query(TgChannel).count()
+    total_tg_posts_sent = db.query(TgScheduledPost).filter(TgScheduledPost.status == "sent").count()
+    total_tg_posts_pending = db.query(TgScheduledPost).filter(TgScheduledPost.status == "pending").count()
+
+    bot_running_flag = bot_module.BOT_RUNNING
+    tg_running = telegram_service.is_running
+
+    total_ig_cost = round((total_targets_sent + total_comments_sent) * 0.45, 2)
+    total_tg_cost = round(total_tg_posts_sent * 0.27, 2)
+    total_system_cost = round(total_ig_cost + total_tg_cost, 2)
+
+    return {
+        "ig_bot_running": bot_running_flag,
+        "tg_service_running": tg_running,
+        "bot_running": bot_running_flag,
+        "total_users": total_users,
+        "total_accounts": total_accounts,
+        "total_dms_sent": total_targets_sent + total_comments_sent,
+        "total_dms_failed": total_targets_failed + total_comments_failed,
+        "total_pending_targets": total_pending_targets,
+        "total_tg_bots": total_tg_bots,
+        "total_tg_channels": total_tg_channels,
+        "total_tg_posts_sent": total_tg_posts_sent,
+        "total_tg_posts_pending": total_tg_posts_pending,
+        "total_ig_cost": total_ig_cost,
+        "total_tg_cost": total_tg_cost,
+        "total_system_cost": total_system_cost,
+    }
+
+
+@app.patch("/api/admin/users/{user_id}/toggle-enabled")
+def admin_toggle_user_enabled(user_id: int, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target_user.id == current_admin.id:
+        raise HTTPException(status_code=400, detail="You cannot disable your own account.")
+    target_user.is_enabled = not getattr(target_user, "is_enabled", True)
+    db.commit()
+    action = "enabled" if target_user.is_enabled else "disabled"
+    log_to_db("WARNING", f"Admin {current_admin.username} {action} user @{target_user.username}")
+    return {"message": f"User @{target_user.username} {action}.", "is_enabled": target_user.is_enabled}
+
+
+@app.patch("/api/admin/users/{user_id}/toggle-approved")
+def admin_toggle_user_approved(user_id: int, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Grant or revoke a signup's access to the platform."""
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target_user.id == current_admin.id:
+        raise HTTPException(status_code=400, detail="You cannot revoke your own approval.")
+
+    target_user.is_approved = not getattr(target_user, "is_approved", False)
+    action = "approved" if target_user.is_approved else "revoked approval for"
+    audit(db, "user.approval_changed", current_admin, None, "user", target_user.id,
+          {"is_approved": target_user.is_approved, "username": target_user.username})
+    db.add(Notification(
+        user_id=target_user.id,
+        title="Account approved" if target_user.is_approved else "Access revoked",
+        message=("Your account has been approved. You can sign in and start automating."
+                 if target_user.is_approved else
+                 "An administrator has revoked access to your account."),
+        category="account",
+    ))
+    db.commit()
+    log_to_db("WARNING", f"Admin {current_admin.username} {action} @{target_user.username}")
+    return {"message": f"User @{target_user.username} {action}.", "is_approved": target_user.is_approved}
+
+
+@app.post("/api/admin/system/start")
+async def admin_start_all(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    ig_started = start_bot_background()
+    if not telegram_service.is_running:
+        await telegram_service.start()
+    log_to_db("INFO", f"Admin {current_admin.username} started all automation systems (IG + TG)")
+    return {
+        "ig_bot_running": True,
+        "tg_service_running": telegram_service.is_running,
+    }
+
+
+@app.post("/api/admin/system/stop")
+async def admin_stop_all(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    stop_bot_background()
+    if telegram_service.is_running:
+        await telegram_service.stop()
+    try:
+        set_system_setting(db, "status", "stopped")
+        db.commit()
+    except Exception:
+        pass
+    log_to_db("INFO", f"Admin {current_admin.username} stopped all automation systems (IG + TG)")
+    return {
+        "ig_bot_running": False,
+        "tg_service_running": False,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM AUTOMATION ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Telegram Bot Config ───────────────────────────────────────────────────────
+
+@app.post("/api/tg/bots")
+async def tg_add_bot(req: TgBotConfigCreate, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    bot_count = db.query(TgBotConfig).filter(TgBotConfig.workspace_id == workspace.id).count()
+    assert_plan_limit(db, workspace, "telegram_bots", bot_count)
+    try:
+        info = await telegram_service.validate_token(req.bot_token)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid bot token: {e}")
+
+    token_hash = stable_hash(req.bot_token)
+    existing = db.query(TgBotConfig).filter(
+        TgBotConfig.bot_token_hash == token_hash,
+        TgBotConfig.workspace_id == workspace.id,
+    ).first()
+    if existing:
+        raise HTTPException(400, "Bot already added")
+
+    bot = TgBotConfig(
+        bot_token=encrypt_secret(req.bot_token),
+        bot_token_hash=token_hash,
+        bot_username=info.get("username"),
+        bot_name=info.get("first_name"),
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+    )
+    db.add(bot)
+    audit(db, "telegram_bot.added", current_user, workspace, "tg_bot", bot.id, {"bot_username": bot.bot_username})
+    db.commit()
+    db.refresh(bot)
+    log_to_db("INFO", f"[TG] Bot @{bot.bot_username} added by {current_user.username}")
+    return {"id": bot.id, "bot_username": bot.bot_username, "bot_name": bot.bot_name}
+
+
+@app.get("/api/tg/bots")
+def tg_list_bots(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    workspace = active_workspace_for_user(db, current_user)
+    bots = db.query(TgBotConfig).filter(TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).all()
+    return [
+        {
+            "id": b.id, "bot_username": b.bot_username, "bot_name": b.bot_name,
+            "is_active": b.is_active, "created_at": b.created_at.isoformat(),
+            "channel_count": len(b.channels),
+            "channels": [
+                {
+                    "id": ch.id,
+                    "chat_id": ch.chat_id,
+                    "title": ch.title,
+                    "username": None,
+                    "chat_type": ch.chat_type,
+                    "added_by": ch.added_by.username if ch.added_by else b.bot_username,
+                }
+                for ch in b.channels
+            ]
+        }
+        for b in bots
+    ]
+
+
+@app.delete("/api/tg/bots/{bot_id}")
+def tg_delete_bot(bot_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    workspace = active_workspace_for_user(db, current_user)
+    bot = db.query(TgBotConfig).filter(TgBotConfig.id == bot_id, TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).first()
+    if not bot:
+        raise HTTPException(404, "Bot not found")
+    db.delete(bot)
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/tg/channels/{channel_id}")
+def tg_delete_channel(channel_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    workspace = active_workspace_for_user(db, current_user)
+    channel = db.query(TgChannel).join(TgBotConfig).filter(
+        TgChannel.id == channel_id,
+        TgBotConfig.user_id == current_user.id,
+        TgBotConfig.workspace_id == workspace.id
+    ).first()
+    if not channel:
+        raise HTTPException(404, "Channel/group not found")
+    db.delete(channel)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Telegram Channels ────────────────────────────────────────────────────────
+
+@app.post("/api/tg/bots/{bot_id}/refresh-channels")
+async def tg_refresh_channels(bot_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    bot = db.query(TgBotConfig).filter(TgBotConfig.id == bot_id, TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).first()
+    if not bot:
+        raise HTTPException(404, "Bot not found")
+
+    channels = await telegram_service.fetch_bot_channels(bot_id, db)
+    return [
+        {
+            "id": c.id, "chat_id": c.chat_id, "title": c.title,
+            "chat_type": c.chat_type, "member_count": c.member_count,
+            "added_by": c.added_by.username if c.added_by else bot.bot_username,
+        }
+        for c in channels
+    ]
+
+
+@app.get("/api/tg/channels")
+def tg_list_channels(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    bots = db.query(TgBotConfig).filter(TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).all()
+    bot_ids = [b.id for b in bots]
+    if not bot_ids:
+        return []
+
+    channels = db.query(TgChannel).filter(TgChannel.bot_id.in_(bot_ids)).all()
+    return [
+        {
+            "id": c.id, "chat_id": c.chat_id, "title": c.title,
+            "chat_type": c.chat_type, "member_count": c.member_count,
+            "is_active": c.is_active,
+            "bot_username": c.bot.bot_username,
+            "added_by": c.added_by.username if c.added_by else c.bot.bot_username,
+        }
+        for c in channels
+    ]
+
+
+@app.post("/api/tg/channels/add-manual")
+async def tg_add_channel_manual(
+    bot_id: int,
+    chat_id: str,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")),
+    db: Session = Depends(get_db),
+):
+    bot = db.query(TgBotConfig).filter(TgBotConfig.id == bot_id, TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).first()
+    if not bot:
+        raise HTTPException(404, "Bot not found")
+
+    parsed_id = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+    try:
+        chat_info = await telegram_service.api_call(bot.bot_token, "getChat", chat_id=parsed_id)
+        member_count_data = await telegram_service.api_call(bot.bot_token, "getChatMemberCount", chat_id=parsed_id)
+        member_count = member_count_data if isinstance(member_count_data, int) else 0
+    except Exception as e:
+        raise HTTPException(400, f"Cannot access chat: {e}. Make sure the bot is added as admin to the channel/group first.")
+
+    real_chat_id = str(chat_info.get("id", chat_id))
+    existing = db.query(TgChannel).join(TgBotConfig).filter(
+        TgChannel.chat_id == real_chat_id,
+        TgBotConfig.workspace_id == workspace.id,
+    ).first()
+    if existing:
+        raise HTTPException(409, "This channel or group is already connected in this workspace")
+
+    ch = TgChannel(
+        chat_id=real_chat_id,
+        title=chat_info.get("title", "Unknown"),
+        chat_type=chat_info.get("type", "channel"),
+        member_count=member_count,
+        bot_id=bot_id,
+        user_id=current_user.id,
+    )
+    db.add(ch)
+    db.commit()
+    db.refresh(ch)
+    return {
+        "id": ch.id,
+        "chat_id": ch.chat_id,
+        "title": ch.title,
+        "chat_type": ch.chat_type,
+        "member_count": ch.member_count,
+        "added_by": current_user.username,
+    }
+
+
+class TgTemplatePayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    content: str = Field(..., min_length=1, max_length=4096)
+
+
+@app.get("/api/tg/templates")
+def tg_list_templates(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    return db.query(TgMessageTemplate).filter(
+        TgMessageTemplate.user_id == current_user.id,
+        TgMessageTemplate.workspace_id == workspace.id,
+    ).order_by(TgMessageTemplate.created_at.desc()).all()
+
+
+@app.post("/api/tg/templates")
+def tg_create_template(payload: TgTemplatePayload, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    name = payload.name.strip()
+    if db.query(TgMessageTemplate).filter(TgMessageTemplate.workspace_id == workspace.id, TgMessageTemplate.name == name).first():
+        raise HTTPException(409, "A Telegram template with this name already exists")
+    template = TgMessageTemplate(name=name, content=payload.content.strip(), user_id=current_user.id, workspace_id=workspace.id)
+    db.add(template)
+    db.commit()
+    db.refresh(template)
+    return template
+
+
+@app.delete("/api/tg/templates/{template_id}")
+def tg_delete_template(template_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    template = db.query(TgMessageTemplate).filter(TgMessageTemplate.id == template_id, TgMessageTemplate.user_id == current_user.id, TgMessageTemplate.workspace_id == workspace.id).first()
+    if not template:
+        raise HTTPException(404, "Template not found")
+    db.delete(template)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Telegram File Upload ─────────────────────────────────────────────────────
+
+import uuid
+from fastapi.responses import FileResponse
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads", "tg")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/api/tg/upload")
+async def tg_upload_media(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    allowed_ext = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".mp4", ".pdf", ".ppt", ".pptx", ".doc", ".docx", ".zip", ".txt", ".csv"}
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in allowed_ext:
+        raise HTTPException(400, f"File type {ext} not allowed")
+
+    if file.size and file.size > 50 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 50MB)")
+
+    original_name = os.path.basename(file.filename or f"attachment{ext}")
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", original_name).strip(" .") or f"attachment{ext}"
+    safe_name = safe_name[-180:]
+    unique_name = f"{uuid.uuid4().hex}__{safe_name}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    content = await file.read()
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 50MB)")
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    return {"filename": unique_name, "original_name": original_name, "size": len(content)}
+
+@app.get("/api/tg/uploads/{filename}")
+async def tg_get_upload(filename: str, current_user: User = Depends(get_current_user)):
+    file_path = resolve_upload_path(UPLOAD_DIR, filename)
+    if not file_path:
+        raise HTTPException(404, "File not found")
+    return FileResponse(file_path)
+
+# ── Telegram Scheduled Posts ─────────────────────────────────────────────────
+
+@app.post("/api/tg/posts/schedule")
+def tg_schedule_post(req: TgScheduledPostCreate, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    channel = db.query(TgChannel).filter(TgChannel.id == req.channel_id).first()
+    if not channel:
+        raise HTTPException(404, "Channel not found")
+
+    bot = channel.bot
+    if bot.user_id != current_user.id or bot.workspace_id != workspace.id:
+        raise HTTPException(403, "Not your channel")
+    if not bot.is_active or not channel.is_active:
+        raise HTTPException(400, "Bot or channel is inactive")
+    if not (req.content or "").strip() and not req.media_path:
+        raise HTTPException(400, "Add message text or an attachment")
+
+    scheduled_at = req.scheduled_at
+    if scheduled_at.tzinfo is not None:
+        scheduled_at = scheduled_at.astimezone(timezone.utc).replace(tzinfo=None)
+    if scheduled_at <= datetime.utcnow():
+        raise HTTPException(400, "Schedule time must be in the future")
+
+    batch_json = None
+    if req.batch_messages:
+        batch_json = json.dumps(req.batch_messages)
+
+    post = TgScheduledPost(
+        content=req.content,
+        message_type=req.message_type or "text",
+        media_type=req.media_type,
+        media_path=req.media_path,
+        scheduled_at=scheduled_at,
+        is_recurring=req.is_recurring,
+        recurrence_rule=req.recurrence_rule,
+        batch_messages=batch_json,
+        channel_id=req.channel_id,
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    ist_time = scheduled_at + timedelta(hours=5, minutes=30)
+    msg_label = "batch" if req.batch_messages else req.message_type or "text"
+    log_to_db("INFO", f"[TG] {msg_label} scheduled for {channel.title} at {ist_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
+    return {"id": post.id, "status": post.status, "scheduled_at": post.scheduled_at.isoformat()}
+
+
+@app.get("/api/tg/posts")
+def tg_list_posts(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    bots = db.query(TgBotConfig).filter(TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).all()
+    bot_ids = [b.id for b in bots]
+    if not bot_ids:
+        return []
+
+    channels = db.query(TgChannel).filter(TgChannel.bot_id.in_(bot_ids)).all()
+    channel_ids = [c.id for c in channels]
+    channel_map = {c.id: c.title for c in channels}
+
+    posts = db.query(TgScheduledPost).filter(
+        TgScheduledPost.channel_id.in_(channel_ids)
+    ).order_by(TgScheduledPost.scheduled_at.desc()).limit(100).all()
+
+    return [
+        {
+            "id": p.id, "content": p.content,
+            "message_type": getattr(p, "message_type", "text") or "text",
+            "media_type": p.media_type,
+            "media_path": p.media_path,
+            "scheduled_at": p.scheduled_at.isoformat(),
+            "status": p.status, "is_recurring": p.is_recurring,
+            "recurrence_rule": p.recurrence_rule,
+            "batch_messages": json.loads(p.batch_messages) if p.batch_messages else None,
+            "error_message": p.error_message,
+            "sent_at": p.sent_at.isoformat() if p.sent_at else None,
+            "created_at": p.created_at.isoformat(),
+            "channel_id": p.channel_id,
+            "channel_title": channel_map.get(p.channel_id, "Unknown"),
+        }
+        for p in posts
+    ]
+
+
+@app.delete("/api/tg/posts/{post_id}")
+def tg_cancel_post(post_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    post = db.query(TgScheduledPost).filter(TgScheduledPost.id == post_id).first()
+    if not post:
+        raise HTTPException(404, "Post not found")
+
+    channel = post.channel
+    if channel.bot.user_id != current_user.id or channel.bot.workspace_id != workspace.id:
+        raise HTTPException(403, "Not your post")
+
+    if post.status == "pending":
+        post.status = "cancelled"
+        db.commit()
+    else:
+        db.delete(post)
+        db.commit()
+    return {"ok": True}
+
+
+@app.patch("/api/tg/posts/{post_id}")
+def tg_update_post(post_id: int, req: TgScheduledPostUpdate, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    post = db.query(TgScheduledPost).filter(TgScheduledPost.id == post_id).first()
+    if not post:
+        raise HTTPException(404, "Post not found")
+    channel = post.channel
+    if channel.bot.user_id != current_user.id or channel.bot.workspace_id != workspace.id:
+        raise HTTPException(403, "Not your post")
+    if post.status != "pending":
+        raise HTTPException(400, "Only pending posts can be edited")
+    if req.content is not None:
+        post.content = req.content
+    if req.scheduled_at is not None:
+        scheduled_at = req.scheduled_at
+        if scheduled_at.tzinfo is not None:
+            scheduled_at = scheduled_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if scheduled_at <= datetime.utcnow():
+            raise HTTPException(400, "Schedule time must be in the future")
+        post.scheduled_at = scheduled_at
+    if req.message_type is not None:
+        post.message_type = req.message_type
+    if req.media_type is not None:
+        post.media_type = req.media_type
+    if req.media_path is not None:
+        post.media_path = req.media_path
+    if req.is_recurring is not None:
+        post.is_recurring = req.is_recurring
+    if req.recurrence_rule is not None:
+        post.recurrence_rule = req.recurrence_rule
+    if req.batch_messages is not None:
+        post.batch_messages = json.dumps(req.batch_messages)
+    db.commit()
+    db.refresh(post)
+    return {"id": post.id, "status": post.status, "scheduled_at": post.scheduled_at.isoformat()}
+
+
+@app.post("/api/tg/posts/{post_id}/send-now")
+async def tg_send_now(post_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    post = db.query(TgScheduledPost).filter(TgScheduledPost.id == post_id).first()
+    if not post or post.channel.bot.user_id != current_user.id or post.channel.bot.workspace_id != workspace.id:
+        raise HTTPException(404, "Post not found")
+
+    channel = post.channel
+    bot = channel.bot
+    if not channel.is_active or not bot.is_active:
+        raise HTTPException(400, "Bot or channel is inactive")
+    if post.status not in ("pending", "failed"):
+        raise HTTPException(409, f"Post is already {post.status}")
+    try:
+        claimed = db.query(TgScheduledPost).filter(
+            TgScheduledPost.id == post_id,
+            TgScheduledPost.status.in_(("pending", "failed")),
+        ).update({"status": "processing", "error_message": None}, synchronize_session=False)
+        db.commit()
+        if not claimed:
+            raise HTTPException(409, "Post is already being processed")
+        db.refresh(post)
+
+        result = await telegram_service.send_post(bot.bot_token, channel.chat_id, post)
+
+        post.status = "sent"
+        post.sent_at = datetime.utcnow()
+        db.add(TgPostLog(channel_id=channel.id, message_id=str(result.get("message_id", "")), content_preview=(post.content or "")[:200], status="sent"))
+        db.commit()
+        return {"ok": True, "status": "sent"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        post.status = "failed"
+        post.error_message = str(e)[:500]
+        db.commit()
+        raise HTTPException(500, f"Send failed: {e}")
+
+
+# ── Telegram Moderation Rules ───────────────────────────────────────────────
+
+@app.post("/api/tg/moderation/rules")
+def tg_create_rule(req: TgModerationRuleCreate, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    channel = db.query(TgChannel).filter(TgChannel.id == req.channel_id).first()
+    if not channel or channel.bot.user_id != current_user.id or channel.bot.workspace_id != workspace.id:
+        raise HTTPException(404, "Channel not found")
+
+    try:
+        json.loads(req.config)
+    except Exception:
+        raise HTTPException(400, "Config must be valid JSON")
+
+    rule = TgModerationRule(
+        rule_type=req.rule_type,
+        config=req.config,
+        channel_id=req.channel_id,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    log_to_db("INFO", f"[TG] Moderation rule '{req.rule_type}' added for {channel.title}")
+    return {"id": rule.id, "rule_type": rule.rule_type, "is_active": rule.is_active}
+
+
+@app.get("/api/tg/moderation/rules")
+def tg_list_rules(current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    bots = db.query(TgBotConfig).filter(TgBotConfig.user_id == current_user.id, TgBotConfig.workspace_id == workspace.id).all()
+    bot_ids = [b.id for b in bots]
+    channels = db.query(TgChannel).filter(TgChannel.bot_id.in_(bot_ids)).all()
+    channel_ids = [c.id for c in channels]
+    channel_map = {c.id: c.title for c in channels}
+
+    rules = db.query(TgModerationRule).filter(TgModerationRule.channel_id.in_(channel_ids)).all()
+    return [
+        {
+            "id": r.id, "rule_type": r.rule_type, "config": r.config,
+            "is_active": r.is_active, "channel_id": r.channel_id,
+            "channel_title": channel_map.get(r.channel_id, "Unknown"),
+        }
+        for r in rules
+    ]
+
+
+@app.patch("/api/tg/moderation/rules/{rule_id}/toggle")
+def tg_toggle_rule(rule_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    rule = db.query(TgModerationRule).filter(TgModerationRule.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Rule not found")
+    if rule.channel.bot.user_id != current_user.id or rule.channel.bot.workspace_id != workspace.id:
+        raise HTTPException(403, "Not your rule")
+
+    rule.is_active = not rule.is_active
+    db.commit()
+    return {"id": rule.id, "is_active": rule.is_active}
+
+
+@app.delete("/api/tg/moderation/rules/{rule_id}")
+def tg_delete_rule(rule_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(require_workspace_role("owner", "admin", "member")), db: Session = Depends(get_db)):
+    rule = db.query(TgModerationRule).filter(TgModerationRule.id == rule_id).first()
+    if not rule or rule.channel.bot.user_id != current_user.id or rule.channel.bot.workspace_id != workspace.id:
+        raise HTTPException(404, "Rule not found")
+    db.delete(rule)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Telegram Service Control ────────────────────────────────────────────────
+
+@app.post("/api/tg/service/start")
+async def tg_start_service(current_admin: User = Depends(get_current_admin)):
+    await telegram_service.start()
+    log_to_db("INFO", f"[TG] Service started by admin: {current_admin.username}")
+    return {"status": "running"}
+
+
+@app.post("/api/tg/service/stop")
+async def tg_stop_service(current_admin: User = Depends(get_current_admin)):
+    await telegram_service.stop()
+    log_to_db("INFO", f"[TG] Service stopped by admin: {current_admin.username}")
+    return {"status": "stopped"}
+
+
+@app.get("/api/tg/service/status")
+def tg_service_status():
+    return {"running": telegram_service.is_running}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Analytics Dashboard ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/analytics/dashboard", response_model=AnalyticsDashboardResponse)
+def analytics_dashboard(
+    days: int = 30,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    from datetime import timedelta
+    from sqlalchemy import func, cast, Date
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    base_q = db.query(Target).join(Account).filter(
+        Account.workspace_id == workspace.id,
+        Target.created_at >= cutoff,
+    )
+
+    total_sent = base_q.filter(Target.status == "sent").count()
+    total_failed = base_q.filter(Target.status == "failed").count()
+    total_pending = base_q.filter(Target.status == "pending").count()
+    total_contacts = db.query(Contact).filter(Contact.workspace_id == workspace.id).count()
+    total_templates = db.query(MessageTemplate).filter(MessageTemplate.workspace_id == workspace.id).count()
+    total_accounts = db.query(Account).filter(Account.workspace_id == workspace.id).count()
+
+    total_comments_sent = db.query(ProcessedComment).join(MonitoredPost).join(Account).filter(
+        Account.workspace_id == workspace.id,
+        ProcessedComment.processed_at >= cutoff,
+        ProcessedComment.status == "sent"
+    ).count()
+
+    total_comments_failed = db.query(ProcessedComment).join(MonitoredPost).join(Account).filter(
+        Account.workspace_id == workspace.id,
+        ProcessedComment.processed_at >= cutoff,
+        ProcessedComment.status == "failed"
+    ).count()
+
+    tg_bot_objs = db.query(TgBotConfig).filter(TgBotConfig.workspace_id == workspace.id).all()
+    tg_posts_sent = 0
+    if tg_bot_objs:
+        tg_bot_ids = [b.id for b in tg_bot_objs]
+        tg_channels = db.query(TgChannel).filter(TgChannel.bot_id.in_(tg_bot_ids)).all()
+        if tg_channels:
+            ch_ids = [ch.id for ch in tg_channels]
+            tg_posts_sent = db.query(TgScheduledPost).filter(
+                TgScheduledPost.channel_id.in_(ch_ids),
+                TgScheduledPost.status == "sent",
+                TgScheduledPost.sent_at >= cutoff
+            ).count()
+
+    ig_cost = round((total_sent + total_comments_sent) * 0.45, 2)
+    tg_cost = round(tg_posts_sent * 0.27, 2)
+    total_cost = round(ig_cost + tg_cost, 2)
+
+    rows = (
+        db.query(
+            func.date(Target.created_at).label("day"),
+            Target.status,
+            func.count(Target.id),
+        )
+        .join(Account)
+        .filter(Account.workspace_id == workspace.id, Target.created_at >= cutoff)
+        .group_by(func.date(Target.created_at), Target.status)
+        .all()
+    )
+
+    day_map: Dict[str, dict] = {}
+    for day_val, st, cnt in rows:
+        d = str(day_val)
+        if d not in day_map:
+            day_map[d] = {"date": d, "sent": 0, "failed": 0, "pending": 0}
+        if st in day_map[d]:
+            day_map[d][st] += cnt
+
+    time_series = sorted(day_map.values(), key=lambda x: x["date"])
+
+    return AnalyticsDashboardResponse(
+        total_sent=total_sent + total_comments_sent,
+        total_failed=total_failed + total_comments_failed,
+        total_pending=total_pending,
+        total_contacts=total_contacts,
+        total_templates=total_templates,
+        total_accounts=total_accounts,
+        total_ig_sent=total_sent + total_comments_sent,
+        total_tg_sent=tg_posts_sent,
+        ig_cost=ig_cost,
+        tg_cost=tg_cost,
+        total_cost=total_cost,
+        time_series=[AnalyticsPointSchema(**p) for p in time_series],
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Notification Center ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/notifications", response_model=List[NotificationResponse])
+def list_notifications(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(Notification)
+        .filter(Notification.user_id == current_user.id)
+        .order_by(Notification.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+@app.get("/api/notifications/unread-count")
+def notification_unread_count(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    count = db.query(Notification).filter(
+        Notification.user_id == current_user.id,
+        Notification.is_read == False,
+    ).count()
+    return {"count": count}
+
+
+@app.patch("/api/notifications/{notif_id}/read")
+def mark_notification_read(
+    notif_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    n = db.query(Notification).filter(
+        Notification.id == notif_id,
+        Notification.user_id == current_user.id,
+    ).first()
+    if not n:
+        raise HTTPException(404, "Notification not found")
+    n.is_read = True
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/notifications/read-all")
+def mark_all_notifications_read(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    db.query(Notification).filter(
+        Notification.user_id == current_user.id,
+        Notification.is_read == False,
+    ).update({"is_read": True}, synchronize_session=False)
+    db.commit()
+    return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Media Library ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+MEDIA_DIR = os.path.join(os.path.dirname(__file__), "uploads", "media")
+os.makedirs(MEDIA_DIR, exist_ok=True)
+
+
+@app.post("/api/media/upload", response_model=MediaFileResponse)
+async def upload_media(
+    file: UploadFile = File(...),
+    folder: str = "general",
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    ext = os.path.splitext(file.filename or "file")[1].lower()
+    allowed = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".mp4", ".mp3", ".pdf", ".svg", ".ppt", ".pptx", ".doc", ".docx", ".txt", ".csv"}
+    if ext not in allowed:
+        raise HTTPException(400, f"File type {ext} not allowed")
+
+    content = await file.read()
+    max_size = 25 * 1024 * 1024
+    if len(content) > max_size:
+        raise HTTPException(400, "File too large (max 25 MB)")
+
+    unique_name = f"{int(time.time())}_{secrets.token_hex(6)}{ext}"
+    file_path = os.path.join(MEDIA_DIR, unique_name)
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    file_type = "image" if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"} else "video" if ext == ".mp4" else "audio" if ext == ".mp3" else "document"
+
+    media = MediaFile(
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        filename=unique_name,
+        original_name=file.filename or "file",
+        file_type=file_type,
+        mime_type=file.content_type,
+        file_size=len(content),
+        folder=folder,
+    )
+    db.add(media)
+    db.commit()
+    db.refresh(media)
+    return media
+
+
+@app.get("/api/media", response_model=List[MediaFileResponse])
+def list_media(
+    folder: Optional[str] = None,
+    file_type: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    q = db.query(MediaFile).filter(MediaFile.workspace_id == workspace.id)
+    if folder:
+        q = q.filter(MediaFile.folder == folder)
+    if file_type:
+        q = q.filter(MediaFile.file_type == file_type)
+    return q.order_by(MediaFile.created_at.desc()).all()
+
+
+@app.get("/api/media/{media_id}/file")
+def serve_media_file(media_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    from fastapi.responses import FileResponse as FastAPIFileResponse
+
+    media = db.query(MediaFile).filter(MediaFile.id == media_id, MediaFile.workspace_id == workspace.id).first()
+    if not media:
+        raise HTTPException(404, "File not found")
+    path = os.path.join(MEDIA_DIR, media.filename)
+    if not os.path.exists(path):
+        raise HTTPException(404, "File missing from disk")
+    return FastAPIFileResponse(path, media_type=media.mime_type, filename=media.original_name)
+
+
+@app.get("/api/media/{media_id}/presentation-preview")
+def preview_presentation(media_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    """Extract readable slide text from a protected PPTX file."""
+    import re
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    media = db.query(MediaFile).filter(MediaFile.id == media_id, MediaFile.workspace_id == workspace.id).first()
+    if not media:
+        raise HTTPException(404, "File not found")
+    if os.path.splitext(media.filename)[1].lower() != ".pptx":
+        raise HTTPException(400, "Preview is available for PPTX files; legacy PPT files can be downloaded")
+    path = os.path.join(MEDIA_DIR, media.filename)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = sorted(
+                (name for name in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
+                key=lambda name: int(re.search(r"\d+", name).group()),
+            )
+            slides = []
+            for index, name in enumerate(names[:100], 1):
+                root = ET.fromstring(archive.read(name))
+                lines = [node.text for node in root.iter() if node.tag.endswith("}t") and node.text]
+                slides.append({"number": index, "text": lines})
+        return {"name": media.original_name, "slide_count": len(names), "slides": slides}
+    except (zipfile.BadZipFile, ET.ParseError):
+        raise HTTPException(422, "This presentation could not be previewed")
+
+
+@app.post("/api/media/{media_id}/use/telegram")
+def use_media_in_telegram(media_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    """Create a Telegram attachment reference from a workspace library file."""
+    import shutil
+
+    media = db.query(MediaFile).filter(MediaFile.id == media_id, MediaFile.workspace_id == workspace.id).first()
+    if not media:
+        raise HTTPException(404, "File not found")
+    source = os.path.join(MEDIA_DIR, media.filename)
+    if not os.path.exists(source):
+        raise HTTPException(404, "File missing from disk")
+    ext = os.path.splitext(media.filename)[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".mp4", ".pdf", ".svg", ".mp3", ".ppt", ".pptx", ".doc", ".docx", ".txt", ".csv"}:
+        raise HTTPException(400, "This file type cannot be used in Telegram")
+    safe_original = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", os.path.basename(media.original_name)).strip(" .") or f"attachment{ext}"
+    safe_original = safe_original[-180:]
+    telegram_name = f"library_{media.id}_{secrets.token_hex(4)}__{safe_original}"
+    shutil.copy2(source, os.path.join(UPLOAD_DIR, telegram_name))
+    return {"filename": telegram_name, "original_name": media.original_name, "file_type": media.file_type}
+
+
+@app.delete("/api/media/{media_id}")
+def delete_media(media_id: int, current_user: User = Depends(get_current_user), workspace: Workspace = Depends(get_current_workspace), db: Session = Depends(get_db)):
+    media = db.query(MediaFile).filter(MediaFile.id == media_id, MediaFile.workspace_id == workspace.id).first()
+    if not media:
+        raise HTTPException(404, "File not found")
+    path = os.path.join(MEDIA_DIR, media.filename)
+    if os.path.exists(path):
+        os.remove(path)
+    db.delete(media)
+    db.commit()
+    return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Contact CRM ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/contacts", response_model=List[ContactResponse])
+def list_contacts(
+    status: Optional[str] = None,
+    platform: Optional[str] = None,
+    search: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Contact).filter(Contact.workspace_id == workspace.id)
+    if status:
+        q = q.filter(Contact.status == status)
+    if platform:
+        q = q.filter(Contact.platform == platform)
+    if search:
+        q = q.filter(Contact.username.ilike(f"%{search}%") | Contact.display_name.ilike(f"%{search}%"))
+    return q.order_by(Contact.created_at.desc()).all()
+
+
+@app.post("/api/contacts", response_model=ContactResponse)
+def create_contact(
+    payload: ContactCreate,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    contact = Contact(
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        username=payload.username,
+        platform=payload.platform,
+        display_name=payload.display_name,
+        tags=payload.tags,
+        notes=payload.notes,
+        status=payload.status,
+    )
+    db.add(contact)
+    db.commit()
+    db.refresh(contact)
+    return contact
+
+
+@app.patch("/api/contacts/{contact_id}", response_model=ContactResponse)
+def update_contact(
+    contact_id: int,
+    payload: ContactUpdate,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    c = db.query(Contact).filter(Contact.id == contact_id, Contact.workspace_id == workspace.id).first()
+    if not c:
+        raise HTTPException(404, "Contact not found")
+    for field, val in payload.model_dump(exclude_unset=True).items():
+        setattr(c, field, val)
+    db.commit()
+    db.refresh(c)
+    return c
+
+
+@app.delete("/api/contacts/{contact_id}")
+def delete_contact(
+    contact_id: int,
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    c = db.query(Contact).filter(Contact.id == contact_id, Contact.workspace_id == workspace.id).first()
+    if not c:
+        raise HTTPException(404, "Contact not found")
+    db.delete(c)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/contacts/import")
+def import_contacts(
+    payload: List[ContactCreate],
+    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_current_workspace),
+    db: Session = Depends(get_db),
+):
+    created = 0
+    for item in payload:
+        existing = db.query(Contact).filter(
+            Contact.workspace_id == workspace.id,
+            Contact.username == item.username,
+            Contact.platform == item.platform,
+        ).first()
+        if not existing:
+            db.add(Contact(
+                user_id=current_user.id,
+                workspace_id=workspace.id,
+                username=item.username,
+                platform=item.platform,
+                display_name=item.display_name,
+                tags=item.tags,
+                notes=item.notes,
+                status=item.status,
+            ))
+            created += 1
+    db.commit()
+    return {"imported": created, "skipped": len(payload) - created}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Admin: Audit Logs ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/audit-logs", response_model=List[AuditLogResponse])
+def admin_audit_logs(
+    limit: int = 100,
+    action: Optional[str] = None,
+    user_id: Optional[int] = None,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    q = db.query(AuditLog)
+    if action:
+        q = q.filter(AuditLog.action.ilike(f"%{action}%"))
+    if user_id:
+        q = q.filter(AuditLog.user_id == user_id)
+    return q.order_by(AuditLog.created_at.desc()).limit(limit).all()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Admin: Feature Flags / Global Config ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/feature-flags", response_model=List[FeatureFlagResponse])
+def admin_list_feature_flags(
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    return db.query(FeatureFlag).order_by(FeatureFlag.key).all()
+
+
+@app.post("/api/admin/feature-flags", response_model=FeatureFlagResponse)
+def admin_create_feature_flag(
+    payload: FeatureFlagCreate,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    existing = db.query(FeatureFlag).filter(FeatureFlag.key == payload.key).first()
+    if existing:
+        raise HTTPException(400, f"Flag '{payload.key}' already exists")
+    flag = FeatureFlag(key=payload.key, value=payload.value, scope=payload.scope, scope_id=payload.scope_id)
+    db.add(flag)
+    db.commit()
+    db.refresh(flag)
+    return flag
+
+
+@app.patch("/api/admin/feature-flags/{flag_id}", response_model=FeatureFlagResponse)
+def admin_update_feature_flag(
+    flag_id: int,
+    payload: FeatureFlagUpdate,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    flag = db.query(FeatureFlag).filter(FeatureFlag.id == flag_id).first()
+    if not flag:
+        raise HTTPException(404, "Flag not found")
+    for field, val in payload.model_dump(exclude_unset=True).items():
+        setattr(flag, field, val)
+    db.commit()
+    db.refresh(flag)
+    return flag
+
+
+@app.delete("/api/admin/feature-flags/{flag_id}")
+def admin_delete_feature_flag(
+    flag_id: int,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    flag = db.query(FeatureFlag).filter(FeatureFlag.id == flag_id).first()
+    if not flag:
+        raise HTTPException(404, "Flag not found")
+    db.delete(flag)
+    db.commit()
+    return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Admin: System Health ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/health")
+def admin_system_health(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    import platform as plat
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+
+    disk = mem = None
+    cpu_percent = None
+    if psutil:
+        try:
+            disk_root = os.path.abspath(os.sep)
+            disk = psutil.disk_usage(disk_root)
+        except (OSError, PermissionError):
+            disk = None
+        try:
+            mem = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=None)
+        except (OSError, PermissionError):
+            mem = None
+
+    db_size = None
+    db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "insta_automate.db"))
+    if os.path.exists(db_path):
+        db_size = os.path.getsize(db_path)
+
+    return {
+        "platform": plat.system(),
+        "python_version": plat.python_version(),
+        "cpu_percent": cpu_percent,
+        "memory": {"total": mem.total, "used": mem.used, "percent": mem.percent} if mem else None,
+        "disk": {"total": disk.total, "used": disk.used, "percent": disk.percent} if disk else None,
+        "db_size_bytes": db_size,
+        "ig_bot_running": getattr(bot_module, "BOT_RUNNING", False),
+        "tg_service_running": telegram_service.is_running,
+        "uptime_seconds": int(time.time() - app.state.start_time) if hasattr(app.state, "start_time") else None,
+    }
