@@ -1,0 +1,56 @@
+Database migrations (Alembic)
+=============================
+
+The database URL comes from `backend.config.settings.DATABASE_URL` via env.py,
+not from alembic.ini, so migrations always target the same database the app
+runs against.
+
+Common commands (run from the repository root):
+
+    alembic current                     # which revision is applied
+    alembic history                     # all revisions
+    alembic upgrade head                # apply outstanding migrations
+    alembic downgrade -1                # roll back one revision
+    alembic check                       # fail if models have drifted
+
+To add a migration after changing a model in backend/database.py:
+
+    alembic revision --autogenerate -m "short description"
+
+Always read the generated script before applying it. Autogenerate detects
+schema shape, not intent — it cannot know that a rename is a rename rather
+than a drop plus an add, and it will not migrate data for you.
+
+
+SQLite: batch mode and foreign keys
+-----------------------------------
+
+SQLite cannot ALTER most constraints in place, so env.py sets
+`render_as_batch=True`. Batch mode rebuilds the table: create a new one, copy
+rows, drop the original, rename.
+
+That interacts badly with `PRAGMA foreign_keys=ON`, which backend.database
+enables on every connection. Dropping a table makes any ON DELETE CASCADE
+pointing at it fire, deleting child rows — rebuilding `tg_bot_configs` will
+silently empty `tg_channels`. env.py therefore disables enforcement for the
+duration of the migration and runs `PRAGMA foreign_key_check` afterwards,
+raising if the rebuild left anything dangling.
+
+Back up the database before applying a migration that rebuilds a table with
+data in it, and check row counts afterwards.
+
+
+Revisions
+---------
+
+44a67695df92  baseline schema
+              The full schema as it stood when Alembic was introduced.
+              Pre-existing databases were stamped with this rather than
+              having it applied.
+
+3a9fabb7d6cf  enforce workspace foreign keys and token hash index
+              The workspace_id columns had been added by the hand-rolled
+              ensure_saas_columns() helper as plain INTEGERs with no foreign
+              key, so the ON DELETE CASCADE declared on the models was never
+              enforced and deleting a workspace orphaned its tenant data.
+              Also adds the missing index on tg_bot_configs.bot_token_hash.
